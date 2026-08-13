@@ -147,3 +147,55 @@ class SplitterCache:
                 logger.warning("CodeSplitter not available for '%s'(%s); using SentenceSplitter",language,exc,)
                 self._cache[language] = self._fallback
         return self._cache[language]
+
+### CORE PARSING FUNCTION
+
+def parse_repo(owner: str, repo: str, branch: str, tree: list[dict]) -> list[dict]:
+    """
+    Filter, fetch, and chunk a repository's files.
+    Does not generate Embedding or interact with a vector store.
+    """
+    relevant_file = filter_relevant_file(tree)
+    splitter_cache = SplitterCache()
+    all_chunks: list[dict] = []
+
+    for file_item in relevant_file:
+        path = file_item["path"]
+
+        try:
+            content = github_service.get_file_content(owner, repo, path, branch)
+        except httpx.HTTPError as exc:
+            logger.info("Skipping %s: GitHub fetch failed (%s)", path, exc)
+            continue
+
+        if not content or not content.strip():
+            logger.debug("Skipping %s: empty file", path)
+            continue
+
+        if is_binary_content(content):
+            logger.debug("Skipping %s: detected as binary content", path)
+            continue
+
+        language = detect_language(path)
+        splitter = splitter_cache.get(language)
+
+        try:
+            document = Document(text=content)
+            nodes = splitter.get_nodes_from_documents([document])
+        except ValueError as exc:
+            logger.info("Skipping %s: failed to chunk (%s)", path, exc)
+            continue
+
+        for idx,node in enumerate(nodes):
+            all_chunks.append({
+                "content": node.get_content(),
+                "file_path": path,
+                "language": language,
+                "chunk_index": idx,
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "file_extension": Path(path).suffix.lower(),
+            })
+
+    return all_chunks
