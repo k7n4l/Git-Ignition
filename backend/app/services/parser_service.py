@@ -4,6 +4,7 @@ from pathlib import Path
 from llama_index.core.node_parser import CodeSplitter,SentenceSplitter
 from llama_index.core.schema import Document
 from app.services import github_service
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,11 @@ LANGUAGE_MAP: dict[str, str] = {
 ## DUE TO DOCKER FILE NOT HAVING ANY EXTENSION
 DOCKERFILE_NAMES = {"Dockerfile", "dockerfile"}
 
+## LANGUAGE CODE SPLITTER SET
+CODE_SPLITTER_LANGUAGES: set[str] = {
+    "python", "javascript", "typescript", "tsx", "jsx", "java", "go",
+    "ruby", "rust", "c", "cpp", "c_sharp", "php", "html", "css",
+}
 
 ### HELPER FOR FILE FILTERING BEFORE CHUNKING ###
 
@@ -118,4 +124,26 @@ def is_binary_content(content:str) ->bool:
     non_printable = sum(1 for ch in sample if ord(ch)< 9 or 13 <  ord(ch) <32)
     return (non_printable/len(sample)) > 0.05
 
+
 ### SPLITTER CACHE: ###
+
+class SplitterCache:
+    """
+    One CodeSplitter per language, 
+    one shared SentenceSplitter fallback for everything else.
+    """
+    def __init__(self) -> None:
+        self._cache: dict[str, object] = {}
+        self._fallback = SentenceSplitter(chunk_size=512,chunk_overlap=50)
+
+    def get(self,language: Optional[str]):
+        if language is None or language not in CODE_SPLITTER_LANGUAGES:
+            return self._fallback
+        if language not in self._cache:
+            try:
+                self._cache[language] = CodeSplitter(language=language,chunk_lines=40,chunk_lines_overlap=5)
+            except Exception as exc:
+                # WARNING AND FALLBACK PERMENANTLY FOR THIS LANGUAGE
+                logger.warning("CodeSplitter not available for '%s'(%s); using SentenceSplitter",language,exc,)
+                self._cache[language] = self._fallback
+        return self._cache[language]
