@@ -21,17 +21,11 @@ IGNORED_LOCK_FILES: set[str] = {
 }
 
 IGNORED_EXTENSIONS: set[str] = {
-    # images
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
-    # fonts
     ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    # media
     ".mp4", ".mov", ".avi", ".mp3", ".wav",
-    # archives
     ".zip", ".tar", ".gz", ".rar", ".7z",
-    # documents / binaries
     ".pdf", ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
-    # ML model weights / serialized models
     ".pkl", ".pt", ".onnx", ".h5", ".ckpt", ".safetensors",
 }
 
@@ -82,21 +76,16 @@ CODE_SPLITTER_LANGUAGES: set[str] = {
 
 ### HELPER FOR FILE FILTERING BEFORE CHUNKING ###
 
-def detect_language(path:str) -> str | None:
-    filename = Path(path).name
-    if filename in DOCKERFILE_NAMES:
-        return "dockerfile"
-    suffix = Path(path).suffix.lower()
-    return LANGUAGE_MAP.get(suffix)
-
 def is_ignored_path(path:str) -> bool:
     parts = Path(path).parts
-    if any(part in IGNORED_DIRS for part in parts):
+    if any(part.lower() in IGNORED_DIRS for part in parts):
         return True
-    return Path(path).name in IGNORED_LOCK_FILES
+    return Path(path).name.lower() in IGNORED_LOCK_FILES
+
 
 def is_ignored_extension(path:str) -> bool:
     return Path(path).suffix.lower() in IGNORED_EXTENSIONS
+
 
 def is_relevant_file(path:str, size: int | None) -> bool:
     if size is not None and size > MAX_FILE_SIZE_BYTES:
@@ -107,12 +96,21 @@ def is_relevant_file(path:str, size: int | None) -> bool:
         return False
     return True
 
-def filter_relevant_file(tree: list[dict]) -> list[dict]:
-    ### BLOB means file ###
+
+def filter_relevant_files(tree: list[dict]) -> list[dict]:
     return [
         item for item in tree
-        if item.get("type") == "blob" and is_relevant_file(item["path"],item.get("size"))
+        if item.get("type") == "blob"
+        and is_relevant_file(item["path"], item.get("size"))
     ]
+
+
+def detect_language(path:str) -> str | None:
+    filename = Path(path).name
+    if filename in DOCKERFILE_NAMES:
+        return "dockerfile"
+    suffix = Path(path).suffix.lower()
+    return LANGUAGE_MAP.get(suffix)
 
 def is_binary_content(content:str) ->bool:
     ###   Catches files that slip past extension filtering (e.g. mislabeled or extensionless binaries)
@@ -129,7 +127,7 @@ def is_binary_content(content:str) ->bool:
 
 class SplitterCache:
     """
-    One CodeSplitter per language, 
+    One CodeSplitter per language,
     one shared SentenceSplitter fallback for everything else.
     """
     def __init__(self) -> None:
@@ -155,11 +153,12 @@ def parse_repo(owner: str, repo: str, branch: str, tree: list[dict]) -> list[dic
     Filter, fetch, and chunk a repository's files.
     Does not generate Embedding or interact with a vector store.
     """
-    relevant_file = filter_relevant_file(tree)
+    relevant_files = filter_relevant_files(tree)
+
     splitter_cache = SplitterCache()
     all_chunks: list[dict] = []
 
-    for file_item in relevant_file:
+    for file_item in relevant_files:
         path = file_item["path"]
 
         try:
