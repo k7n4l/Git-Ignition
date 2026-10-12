@@ -25,13 +25,15 @@ def get_default_branch(owner:str,repo:str) ->str:
     resp.raise_for_status()
     return resp.json()["default_branch"]
 
-def get_repo_tree(owner:str,repo:str, branch: str | None = None) -> dict:
+def get_repo_tree(owner: str, repo: str, branch: str | None = None) -> dict:
     if not branch:
-        branch = get_default_branch(owner,repo)
+        branch = get_default_branch(owner, repo)
+
     url = f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}"
-    resp = httpx.get(url,headers=_headers(),params={"recursive":"1"})
+    resp = httpx.get(url, headers=_headers(), params={"recursive": "1"})
     resp.raise_for_status()
     data = resp.json()
+
 
     return {
         "owner": owner,

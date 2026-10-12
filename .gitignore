@@ -1,14 +1,26 @@
+
 venv/
 .venv/
 __pycache__/
-*.pyc
-backend/.env
+*.py[cod]
+
+# Environment variables and secrets
 .env
+.env.*
+!.env.example
+backend/.env
+
+# Local databases and generated data
 backend/data/
 *.db
 *.sqlite
 *.sqlite3
+
+# Frontend dependencies and build output
 node_modules/
 dist/
 dist-ssr/
 *.local
+
+# Editor settings
+.vscode/
