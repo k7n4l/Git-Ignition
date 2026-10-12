@@ -1,0 +1,200 @@
+import logging
+import httpx
+from pathlib import Path
+from llama_index.core.node_parser import CodeSplitter,SentenceSplitter
+from llama_index.core.schema import Document
+from app.services import github_service
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+##  CONSTANTS ##
+
+IGNORED_DIRS: set[str] = {
+    "node_modules", ".git", "dist", "build", "target", "vendor",
+    ".venv", "venv", "__pycache__", ".next",
+}
+
+IGNORED_LOCK_FILES: set[str] = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "Cargo.lock", "composer.lock", "Pipfile.lock",
+}
+
+IGNORED_EXTENSIONS: set[str] = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".webp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".mov", ".avi", ".mp3", ".wav",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".pdf", ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+    ".pkl", ".pt", ".onnx", ".h5", ".ckpt", ".safetensors",
+}
+
+MAX_FILE_SIZE_BYTES = 200_000
+
+# File extension -> language label.
+LANGUAGE_MAP: dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".jsx": "jsx",
+    ".java": "java",
+    ".go": "go",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".hpp": "cpp",
+    ".cs": "c_sharp",
+    ".php": "php",
+    ".kt": "kotlin",
+    ".swift": "swift",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".scss": "scss",
+    ".sql": "sql",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".xml": "xml",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".md": "markdown",
+}
+## DUE TO DOCKER FILE NOT HAVING ANY EXTENSION
+DOCKERFILE_NAMES = {"Dockerfile", "dockerfile"}
+
+## LANGUAGE CODE SPLITTER SET
+CODE_SPLITTER_LANGUAGES: set[str] = {
+    "python", "javascript", "typescript", "tsx", "jsx", "java", "go",
+    "ruby", "rust", "c", "cpp", "c_sharp", "php", "html", "css",
+}
+
+### HELPER FOR FILE FILTERING BEFORE CHUNKING ###
+
+def is_ignored_path(path:str) -> bool:
+    parts = Path(path).parts
+    if any(part.lower() in IGNORED_DIRS for part in parts):
+        return True
+    return Path(path).name.lower() in IGNORED_LOCK_FILES
+
+
+def is_ignored_extension(path:str) -> bool:
+    return Path(path).suffix.lower() in IGNORED_EXTENSIONS
+
+
+def is_relevant_file(path:str, size: int | None) -> bool:
+    if size is not None and size > MAX_FILE_SIZE_BYTES:
+        return False
+    if is_ignored_path(path):
+        return False
+    if is_ignored_extension(path):
+        return False
+    return True
+
+
+def filter_relevant_files(tree: list[dict]) -> list[dict]:
+    return [
+        item for item in tree
+        if item.get("type") == "blob"
+        and is_relevant_file(item["path"], item.get("size"))
+    ]
+
+
+def detect_language(path:str) -> str | None:
+    filename = Path(path).name
+    if filename in DOCKERFILE_NAMES:
+        return "dockerfile"
+    suffix = Path(path).suffix.lower()
+    return LANGUAGE_MAP.get(suffix)
+
+def is_binary_content(content:str) ->bool:
+    ###   Catches files that slip past extension filtering (e.g. mislabeled or extensionless binaries)
+    if "\x00" in content:
+        return True
+    sample = content[:2000]
+    if not sample:
+        return True
+    non_printable = sum(1 for ch in sample if ord(ch)< 9 or 13 <  ord(ch) <32)
+    return (non_printable/len(sample)) > 0.05
+
+
+### SPLITTER CACHE: ###
+
+class SplitterCache:
+    """
+    One CodeSplitter per language,
+    one shared SentenceSplitter fallback for everything else.
+    """
+    def __init__(self) -> None:
+        self._cache: dict[str, object] = {}
+        self._fallback = SentenceSplitter(chunk_size=512,chunk_overlap=50)
+
+    def get(self,language: Optional[str]):
+        if language is None or language not in CODE_SPLITTER_LANGUAGES:
+            return self._fallback
+        if language not in self._cache:
+            try:
+                self._cache[language] = CodeSplitter(language=language,chunk_lines=40,chunk_lines_overlap=5)
+            except Exception as exc:
+                # WARNING AND FALLBACK PERMENANTLY FOR THIS LANGUAGE
+                logger.warning("CodeSplitter not available for '%s'(%s); using SentenceSplitter",language,exc,)
+                self._cache[language] = self._fallback
+        return self._cache[language]
+
+### CORE PARSING FUNCTION
+
+def parse_repo(owner: str, repo: str, branch: str, tree: list[dict]) -> list[dict]:
+    """
+    Filter, fetch, and chunk a repository's files.
+    Does not generate Embedding or interact with a vector store.
+    """
+    relevant_files = filter_relevant_files(tree)
+
+    splitter_cache = SplitterCache()
+    all_chunks: list[dict] = []
+
+    for file_item in relevant_files:
+        path = file_item["path"]
+
+        try:
+            content = github_service.get_file_content(owner, repo, path, branch)
+        except httpx.HTTPError as exc:
+            logger.info("Skipping %s: GitHub fetch failed (%s)", path, exc)
+            continue
+
+        if not content or not content.strip():
+            logger.debug("Skipping %s: empty file", path)
+            continue
+
+        if is_binary_content(content):
+            logger.debug("Skipping %s: detected as binary content", path)
+            continue
+
+        language = detect_language(path)
+        splitter = splitter_cache.get(language)
+
+        try:
+            document = Document(text=content)
+            nodes = splitter.get_nodes_from_documents([document])
+        except ValueError as exc:
+            logger.info("Skipping %s: failed to chunk (%s)", path, exc)
+            continue
+
+        for idx,node in enumerate(nodes):
+            all_chunks.append({
+                "content": node.get_content(),
+                "file_path": path,
+                "language": language,
+                "chunk_index": idx,
+                "owner": owner,
+                "repo": repo,
+                "branch": branch,
+                "file_extension": Path(path).suffix.lower(),
+            })
+
+    return all_chunks
